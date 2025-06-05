@@ -2,7 +2,6 @@ use ansi_term::Colour;
 use clap::{Parser, Subcommand};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use rayon::prelude::*;
 use rusqlite::{Connection, Result};
 use std::fs;
 use std::path::Path;
@@ -102,59 +101,37 @@ fn search_docset(
     let docs_dir = docset_path.join("Contents/Resources/Documents");
     let conn = Connection::open(&db_path)?;
 
-    let mut matches = Vec::new();
+    let mut stmt = conn.prepare("SELECT name, type, path FROM searchIndex")?;
+    let mut rows = stmt.query([])?;
+
     let matcher = SkimMatcherV2::default();
+    let mut matches = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let typ: String = row.get(1)?;
+        let path: String = row.get(2)?;
+        let html_path = docs_dir.join(&path);
+
+        if query.is_empty() {
+            // List all if no query
+            matches.push((0, name, typ, html_path));
+        } else if let Some(score) = matcher.fuzzy_match(&name, query) {
+            matches.push((score, name, typ, html_path));
+        }
+    }
 
     if query.is_empty() {
-        // Fast path: no fuzzy matching
-        let mut stmt = conn.prepare("SELECT name, type, path FROM searchIndex")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                0, // score
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        matches = rows
-            .map(|r| r.map(|(score, name, typ, path)| (score, name, typ, docs_dir.join(path))))
-            .collect::<Result<Vec<_>, _>>()?;
         matches.sort_by(|a, b| a.1.cmp(&b.1));
     } else {
-        let mut stmt = conn
-            .prepare("SELECT name, type, path FROM searchIndex WHERE name LIKE '%' || ?1 || '%'")?;
-        let rows = stmt.query_map([query], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let candidates: Vec<_> = rows.collect::<Result<_, _>>()?;
-
-        // Parallel fuzzy matching
-        let mut scored: Vec<_> = candidates
-            .par_iter()
-            .filter_map(|(name, typ, path)| {
-                matcher
-                    .fuzzy_match(name, query)
-                    .map(|score| (score, name.clone(), typ.clone(), path.clone()))
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        // Only join path when actually displaying
-        matches = scored
-            .into_iter()
-            .map(|(score, name, typ, path)| (score, name, typ, docs_dir.join(path)))
-            .collect();
+        matches.sort_by(|a, b| b.0.cmp(&a.0));
     }
 
     for (_, name, typ, html_path) in &matches {
         if icons {
             println!(
                 "{}\t{}\t{}\t{}",
-                type_icon(typ),
+                type_icon(&typ),
                 name,
                 typ,
                 html_path.display()
